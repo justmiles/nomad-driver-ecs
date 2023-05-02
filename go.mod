@@ -8,6 +8,7 @@ replace (
 )
 
 require (
+	github.com/aws/aws-sdk-go v1.42.27
 	github.com/aws/aws-sdk-go-v2 v0.19.0
 	github.com/hashicorp/go-hclog v1.2.0
 	github.com/hashicorp/nomad v1.3.0-rc.1

@@ -3,9 +3,14 @@ package ecs
 import (
 	"context"
 	"fmt"
+	"io"
+	"regexp"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 )
 
 // ecsClientInterface encapsulates all the required AWS functionality to
@@ -30,11 +35,15 @@ type ecsClientInterface interface {
 	// be viewed via the AWS console specifying it was this Nomad driver which
 	// performed the action.
 	StopTask(ctx context.Context, taskARN string) error
+
+	// StreamLogs prints task logs to stdout
+	StreamLogs(ctx context.Context, f io.Writer, logToken, taskARN string) (string, error)
 }
 
 type awsEcsClient struct {
-	cluster   string
-	ecsClient *ecs.Client
+	cluster    string
+	ecsClient  *ecs.Client
+	logsClient *cloudwatchlogs.Client
 }
 
 // DescribeCluster satisfies the ecs.ecsClientInterface DescribeCluster
@@ -139,4 +148,40 @@ func (c awsEcsClient) StopTask(ctx context.Context, taskARN string) error {
 
 	_, err := c.ecsClient.StopTaskRequest(&input).Send(ctx)
 	return err
+}
+
+func (c awsEcsClient) StreamLogs(ctx context.Context, f io.Writer, logToken, taskARN string) (string, error) {
+	var re = regexp.MustCompile("[^/]*$")
+	fmt.Println("streaming logs")
+	logEventsInput := cloudwatchlogs.GetLogEventsInput{
+		StartFromHead: aws.Bool(true),
+		LogGroupName:  aws.String("/ecs/whoami"),
+		LogStreamName: aws.String("ecs/whoami/" + re.FindString(taskARN)),
+	}
+
+	if logToken != "" {
+		logEventsInput.NextToken = aws.String(logToken)
+	}
+
+	logEvents, err := c.logsClient.GetLogEventsRequest(&logEventsInput).Send(ctx)
+
+	// todo handle rate limiting
+	if err != nil {
+		if awsErr, ok := err.(awserr.Error); ok {
+			// Get error details
+			if awsErr.Code() == "ResourceNotFoundException" {
+				return logToken, nil
+			} else {
+				fmt.Println(err)
+			}
+		} else {
+			return logToken, err
+		}
+	}
+
+	for _, logEvent := range logEvents.Events {
+		fmt.Fprintf(f, "%v\t%v\n", time.Unix(*logEvent.Timestamp/1000, 0), *logEvent.Message)
+	}
+
+	return *logEvents.NextForwardToken, nil
 }

@@ -112,6 +112,8 @@ func (h *taskHandle) run() {
 		}
 	}()
 
+	var logToken string
+
 	// Block until stopped.
 	for h.ctx.Err() == nil {
 		select {
@@ -130,6 +132,12 @@ func (h *taskHandle) run() {
 			if _, err := fmt.Fprintf(f, "[%s] - client is remotely monitoring ECS task: %v with status %v\n",
 				now, h.arn, status); err != nil {
 				h.handleRunError(err, "failed to write to stdout")
+			}
+
+			logToken, err = h.ecsClient.StreamLogs(h.ctx, f, logToken, h.arn)
+			if err != nil {
+				h.handleRunError(err, "unable to pull logs")
+				return
 			}
 
 			// ECS task has terminal status phase, meaning the task is going to

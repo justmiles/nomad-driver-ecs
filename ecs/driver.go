@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws/external"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad-driver-ecs/version"
@@ -207,8 +208,9 @@ func (d *Driver) getAwsSdk(cluster string) (ecsClientInterface, error) {
 	}
 
 	return awsEcsClient{
-		cluster:   cluster,
-		ecsClient: ecs.New(awsCfg),
+		cluster:    cluster,
+		ecsClient:  ecs.New(awsCfg),
+		logsClient: cloudwatchlogs.New(awsCfg),
 	}, nil
 }
 
