@@ -3,8 +3,6 @@ package ecs
 import (
 	"context"
 	"fmt"
-	"io"
-	"regexp"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -24,7 +22,7 @@ type ecsClientInterface interface {
 
 	// DescribeTaskStatus attempts to return the current health status of the
 	// ECS task and should be used for health checking.
-	DescribeTaskStatus(ctx context.Context, taskARN string) (string, error)
+	DescribeTaskStatus(ctx context.Context, taskDetails TaskDetails) (string, error)
 
 	// RunTask is used to trigger the running of a new ECS task based on the
 	// provided configuration. The ARN of the task, as well as any errors are
@@ -34,16 +32,25 @@ type ecsClientInterface interface {
 	// StopTask stops the running ECS task, adding a custom message which can
 	// be viewed via the AWS console specifying it was this Nomad driver which
 	// performed the action.
-	StopTask(ctx context.Context, taskARN string) error
+	StopTask(ctx context.Context, taskDetails TaskDetails) error
 
-	// StreamLogs prints task logs to stdout
-	StreamLogs(ctx context.Context, f io.Writer, logToken, taskARN string) (string, error)
+	// TODO: implement TaskEvents
+
+	// GetLogs retreives the most recent logs from CloudWatch to be viewed in
+	// in nomads alloc stdout
+	GetLogs(ctx context.Context, taskDetails TaskDetails, logToken string) (string, string, error)
 }
 
 type awsEcsClient struct {
 	cluster    string
 	ecsClient  *ecs.Client
 	logsClient *cloudwatchlogs.Client
+}
+
+type TaskDetails struct {
+	taskARN string
+	group   string
+	stream  string
 }
 
 // DescribeCluster satisfies the ecs.ecsClientInterface DescribeCluster
@@ -69,10 +76,10 @@ func (c awsEcsClient) DescribeCluster(ctx context.Context) error {
 
 // DescribeTaskStatus satisfies the ecs.ecsClientInterface DescribeTaskStatus
 // interface function.
-func (c awsEcsClient) DescribeTaskStatus(ctx context.Context, taskARN string) (string, error) {
+func (c awsEcsClient) DescribeTaskStatus(ctx context.Context, taskDetails TaskDetails) (string, error) {
 	input := ecs.DescribeTasksInput{
 		Cluster: aws.String(c.cluster),
-		Tasks:   []string{taskARN},
+		Tasks:   []string{taskDetails.taskARN},
 	}
 
 	resp, err := c.ecsClient.DescribeTasksRequest(&input).Send(ctx)
@@ -84,8 +91,25 @@ func (c awsEcsClient) DescribeTaskStatus(ctx context.Context, taskARN string) (s
 
 // RunTask satisfies the ecs.ecsClientInterface RunTask interface function.
 func (c awsEcsClient) RunTask(ctx context.Context, cfg TaskConfig) (string, error) {
-	input := c.buildTaskInput(cfg)
 
+	err := c.confirmLogGroup(ctx, cfg)
+	if err != nil {
+		return "", fmt.Errorf("failed to validate log group: %w", err)
+	}
+
+	taskDefInput := c.buildTaskDefInput(cfg)
+	if err := taskDefInput.Validate(); err != nil {
+		return "", fmt.Errorf("failed to validate: %w", err)
+	}
+
+	registerTaskDefinitionResponse, err := c.ecsClient.RegisterTaskDefinitionRequest(taskDefInput).Send(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	cfg.Task.TaskDefinition = *registerTaskDefinitionResponse.TaskDefinition.TaskDefinitionArn
+
+	input := c.buildTaskInput(cfg)
 	if err := input.Validate(); err != nil {
 		return "", fmt.Errorf("failed to validate: %w", err)
 	}
@@ -95,6 +119,70 @@ func (c awsEcsClient) RunTask(ctx context.Context, cfg TaskConfig) (string, erro
 		return "", err
 	}
 	return *resp.RunTaskOutput.Tasks[0].TaskArn, nil
+}
+
+func (c awsEcsClient) confirmLogGroup(ctx context.Context, cfg TaskConfig) error {
+
+	describeLogGroupsResponse, err := c.logsClient.DescribeLogGroupsRequest(&cloudwatchlogs.DescribeLogGroupsInput{
+		LogGroupNamePrefix: &cfg.Task.LogGroup,
+	}).Send(ctx)
+	if err != nil {
+		return err
+	}
+
+	// do nothing if a log group already exists
+	if len(describeLogGroupsResponse.LogGroups) > 0 {
+		return nil
+	}
+
+	// create the log group if not exist
+	_, err = c.logsClient.CreateLogGroupRequest(&cloudwatchlogs.CreateLogGroupInput{
+		LogGroupName: &cfg.Task.LogGroup,
+	}).Send(ctx)
+
+	return err
+}
+
+func (c awsEcsClient) buildTaskDefInput(cfg TaskConfig) *ecs.RegisterTaskDefinitionInput {
+
+	taskDefInput := ecs.RegisterTaskDefinitionInput{
+		Memory: aws.String(fmt.Sprintf("%d", cfg.Task.Memory)),
+		Cpu:    aws.String(fmt.Sprintf("%d", cfg.Task.CPU)),
+		ContainerDefinitions: []ecs.ContainerDefinition{
+			{
+				Command:     append([]string{cfg.Task.Command}, cfg.Task.Args...),
+				Name:        &cfg.Task.Family,
+				Image:       &cfg.Task.Image,
+				Interactive: aws.Bool(true),
+				LogConfiguration: &ecs.LogConfiguration{
+					LogDriver: ecs.LogDriverAwslogs,
+					Options: map[string]string{
+						"awslogs-group":         cfg.Task.LogGroup,
+						"awslogs-region":        cfg.Task.Region,
+						"awslogs-stream-prefix": "nomad",
+					},
+				},
+				Essential: aws.Bool(true),
+				// Environment:  buildEnvironmentKeyValuePair(t.Environment),
+				// PortMappings: buildPortMapping(t.Publish),
+				// MountPoints:  m,
+				// VolumesFrom: []*ecs.VolumeFrom{},
+			},
+		},
+		Family: &cfg.Task.Family,
+		// Volumes:     v,
+		// Family:      aws.String(cfg.Task.),
+		// TaskRoleArn: aws.String(t.TaskRoleArn),
+	}
+
+	// Set Fargate specific configuration
+	if cfg.Task.LaunchType == string(ecs.CompatibilityFargate) {
+		taskDefInput.RequiresCompatibilities = []ecs.Compatibility{ecs.CompatibilityFargate}
+		taskDefInput.NetworkMode = ecs.NetworkModeAwsvpc
+		taskDefInput.ExecutionRoleArn = &cfg.Task.ExecutionRoleArn
+	}
+
+	return &taskDefInput
 }
 
 // buildTaskInput is used to convert the jobspec supplied configuration input
@@ -139,10 +227,10 @@ func (c awsEcsClient) buildTaskInput(cfg TaskConfig) *ecs.RunTaskInput {
 }
 
 // StopTask satisfies the ecs.ecsClientInterface StopTask interface function.
-func (c awsEcsClient) StopTask(ctx context.Context, taskARN string) error {
+func (c awsEcsClient) StopTask(ctx context.Context, taskDetails TaskDetails) error {
 	input := ecs.StopTaskInput{
 		Cluster: aws.String(c.cluster),
-		Task:    &taskARN,
+		Task:    &taskDetails.taskARN,
 		Reason:  aws.String("stopped by nomad-ecs-driver automation"),
 	}
 
@@ -150,17 +238,15 @@ func (c awsEcsClient) StopTask(ctx context.Context, taskARN string) error {
 	return err
 }
 
-func (c awsEcsClient) StreamLogs(ctx context.Context, f io.Writer, logToken, taskARN string) (string, error) {
-	var re = regexp.MustCompile("[^/]*$")
-	fmt.Println("streaming logs")
+func (c awsEcsClient) GetLogs(ctx context.Context, taskDetails TaskDetails, logToken string) (string, string, error) {
 	logEventsInput := cloudwatchlogs.GetLogEventsInput{
 		StartFromHead: aws.Bool(true),
-		LogGroupName:  aws.String("/ecs/whoami"),
-		LogStreamName: aws.String("ecs/whoami/" + re.FindString(taskARN)),
+		LogGroupName:  &taskDetails.group,
+		LogStreamName: &taskDetails.stream,
 	}
 
 	if logToken != "" {
-		logEventsInput.NextToken = aws.String(logToken)
+		logEventsInput.NextToken = &logToken
 	}
 
 	logEvents, err := c.logsClient.GetLogEventsRequest(&logEventsInput).Send(ctx)
@@ -170,18 +256,19 @@ func (c awsEcsClient) StreamLogs(ctx context.Context, f io.Writer, logToken, tas
 		if awsErr, ok := err.(awserr.Error); ok {
 			// Get error details
 			if awsErr.Code() == "ResourceNotFoundException" {
-				return logToken, nil
+				return logToken, "", nil
 			} else {
 				fmt.Println(err)
 			}
 		} else {
-			return logToken, err
+			return logToken, "", err
 		}
 	}
 
+	var logs string
 	for _, logEvent := range logEvents.Events {
-		fmt.Fprintf(f, "%v\t%v\n", time.Unix(*logEvent.Timestamp/1000, 0), *logEvent.Message)
+		logs = fmt.Sprintf("%s%v\t%v\n", logs, time.Unix(*logEvent.Timestamp/1000, 0), *logEvent.Message)
 	}
 
-	return *logEvents.NextForwardToken, nil
+	return *logEvents.NextForwardToken, logs, nil
 }

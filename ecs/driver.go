@@ -3,6 +3,7 @@ package ecs
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws/external"
@@ -60,6 +61,12 @@ var (
 		"launch_type":           hclspec.NewAttr("launch_type", "string", false),
 		"task_definition":       hclspec.NewAttr("task_definition", "string", false),
 		"network_configuration": hclspec.NewBlock("network_configuration", false, awsECSNetworkConfigSpec),
+		"image":                 hclspec.NewAttr("image", "string", true),
+		"task_role_arn":         hclspec.NewAttr("task_role_arn", "string", false),
+		"execution_role_arn":    hclspec.NewAttr("execution_role_arn", "string", true),
+		"family":                hclspec.NewAttr("family", "string", false),
+		"command":               hclspec.NewAttr("command", "string", false),
+		"args":                  hclspec.NewAttr("args", "list(string)", false),
 	})
 
 	// awsECSNetworkConfigSpec is the network configuration for the task.
@@ -131,6 +138,23 @@ type ECSTaskConfig struct {
 	LaunchType           string                   `codec:"launch_type"`
 	TaskDefinition       string                   `codec:"task_definition"`
 	NetworkConfiguration TaskNetworkConfiguration `codec:"network_configuration"`
+	Image                string                   `codec:"image"`
+	TaskRoleArn          string                   `codec:"task_role_arn"` // task_role_arn - (Optional) ARN of IAM role that allows your Amazon ECS container task to make calls to other AWS services.
+	ExecutionRoleArn     string                   `codec:"execution_role_arn"`
+	Family               string                   `codec:"family"`
+	LogGroup             string                   `codec:"log_group"`
+	Command              string                   `codec:"command"`
+	Args                 []string                 `codec:"args"`
+
+	Region string // derived from DriverConfig
+	Memory int64
+	CPU    int64
+
+	// Environment []string // TODO: get from main task config
+	// Volumes    []string // TODO
+	// EfsVolumes []string // TODO
+	// PortMappings     []string TODO: support port mappings
+
 }
 
 type TaskNetworkConfiguration struct {
@@ -303,7 +327,7 @@ func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
 	d.logger.Info("ecs task recovered", "arn", taskState.ARN,
 		"started_at", taskState.StartedAt)
 
-	h := newTaskHandle(d.logger, taskState, handle.Config, d.client)
+	h := newTaskHandle(d.logger, taskState, TaskDetails{}, handle.Config, d.client)
 
 	d.tasks.Set(handle.Config.ID, h)
 
@@ -329,6 +353,27 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 	handle := drivers.NewTaskHandle(taskHandleVersion)
 	handle.Config = cfg
 
+	// set defaults
+	if driverConfig.Task.Region == "" {
+		driverConfig.Task.Region = d.config.Region
+	}
+
+	if driverConfig.Task.Family == "" {
+		driverConfig.Task.Family = cfg.Name
+	}
+
+	if driverConfig.Task.LogGroup == "" {
+		driverConfig.Task.LogGroup = "/ecs/" + driverConfig.Task.Family
+	}
+
+	if cfg.Resources.NomadResources.Memory.MemoryMB != 0 {
+		driverConfig.Task.Memory = cfg.Resources.NomadResources.Memory.MemoryMB
+	}
+
+	if cfg.Resources.NomadResources.Cpu.CpuShares != 0 {
+		driverConfig.Task.CPU = cfg.Resources.NomadResources.Cpu.CpuShares
+	}
+
 	arn, err := d.client.RunTask(context.Background(), driverConfig)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to start ECS task: %v", err)
@@ -342,7 +387,11 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 
 	d.logger.Info("ecs task started", "arn", driverState.ARN, "started_at", driverState.StartedAt)
 
-	h := newTaskHandle(d.logger, driverState, cfg, d.client)
+	h := newTaskHandle(d.logger, driverState, TaskDetails{
+		taskARN: arn,
+		group:   driverConfig.Task.LogGroup,
+		stream:  "nomad/" + driverConfig.Task.Family + "/" + regexp.MustCompile("[^/]*$").FindString(arn),
+	}, cfg, d.client)
 
 	if err := handle.SetDriverState(&driverState); err != nil {
 		d.logger.Error("failed to start task, error setting driver state", "error", err)

@@ -21,9 +21,9 @@ const (
 )
 
 type taskHandle struct {
-	arn       string
-	logger    hclog.Logger
-	ecsClient ecsClientInterface
+	taskDetails TaskDetails
+	logger      hclog.Logger
+	ecsClient   ecsClientInterface
 
 	totalCpuStats  *stats.CpuStats
 	userCpuStats   *stats.CpuStats
@@ -46,22 +46,22 @@ type taskHandle struct {
 	cancel context.CancelFunc
 }
 
-func newTaskHandle(logger hclog.Logger, ts TaskState, taskConfig *drivers.TaskConfig, ecsClient ecsClientInterface) *taskHandle {
+func newTaskHandle(logger hclog.Logger, ts TaskState, taskDetails TaskDetails, taskConfig *drivers.TaskConfig, ecsClient ecsClientInterface) *taskHandle {
 	ctx, cancel := context.WithCancel(context.Background())
 	logger = logger.Named("handle").With("arn", ts.ARN)
 
 	h := &taskHandle{
-		arn:        ts.ARN,
-		ecsClient:  ecsClient,
-		taskConfig: taskConfig,
-		procState:  drivers.TaskStateRunning,
-		startedAt:  ts.StartedAt,
-		exitResult: &drivers.ExitResult{},
-		logger:     logger,
-		doneCh:     make(chan struct{}),
-		detach:     false,
-		ctx:        ctx,
-		cancel:     cancel,
+		taskDetails: taskDetails,
+		ecsClient:   ecsClient,
+		taskConfig:  taskConfig,
+		procState:   drivers.TaskStateRunning,
+		startedAt:   ts.StartedAt,
+		exitResult:  &drivers.ExitResult{},
+		logger:      logger,
+		doneCh:      make(chan struct{}),
+		detach:      false,
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 
 	return h
@@ -79,7 +79,7 @@ func (h *taskHandle) TaskStatus() *drivers.TaskStatus {
 		CompletedAt: h.completedAt,
 		ExitResult:  h.exitResult,
 		DriverAttributes: map[string]string{
-			"arn": h.arn,
+			"arn": h.taskDetails.taskARN,
 		},
 	}
 }
@@ -98,8 +98,15 @@ func (h *taskHandle) run() {
 	}
 	h.stateLock.Unlock()
 
-	// Open the tasks StdoutPath so we can write task health status updates.
-	f, err := fifo.OpenWriter(h.taskConfig.StdoutPath)
+	// Open the tasks StderrPath so we can write task health status updates.
+	fStderr, err := fifo.OpenWriter(h.taskConfig.StderrPath)
+	if err != nil {
+		h.handleRunError(err, "failed to open task stdout path")
+		return
+	}
+
+	// Open the tasks StdoutPath so we can write remote task's stdout.
+	fStdout, err := fifo.OpenWriter(h.taskConfig.StdoutPath)
 	if err != nil {
 		h.handleRunError(err, "failed to open task stdout path")
 		return
@@ -107,7 +114,10 @@ func (h *taskHandle) run() {
 
 	// Run the deferred close in an anonymous routine so we can see any errors.
 	defer func() {
-		if err := f.Close(); err != nil {
+		if err := fStderr.Close(); err != nil {
+			h.logger.Error("failed to close task stderr handle correctly", "error", err)
+		}
+		if err := fStdout.Close(); err != nil {
 			h.logger.Error("failed to close task stdout handle correctly", "error", err)
 		}
 	}()
@@ -119,7 +129,7 @@ func (h *taskHandle) run() {
 		select {
 		case <-time.After(5 * time.Second):
 
-			status, err := h.ecsClient.DescribeTaskStatus(h.ctx, h.arn)
+			status, err := h.ecsClient.DescribeTaskStatus(h.ctx, h.taskDetails)
 			if err != nil {
 				h.handleRunError(err, "failed to find ECS task")
 				return
@@ -129,15 +139,19 @@ func (h *taskHandle) run() {
 			// alloc logs include the health during the ECS tasks terminal
 			// phase.
 			now := time.Now().Format(time.RFC3339)
-			if _, err := fmt.Fprintf(f, "[%s] - client is remotely monitoring ECS task: %v with status %v\n",
-				now, h.arn, status); err != nil {
-				h.handleRunError(err, "failed to write to stdout")
+			if _, err := fmt.Fprintf(fStderr, "[%s] - client is remotely monitoring ECS task: %v with status %v\n",
+				now, h.taskDetails.taskARN, status); err != nil {
+				h.handleRunError(err, "failed to write to stderr")
 			}
-
-			logToken, err = h.ecsClient.StreamLogs(h.ctx, f, logToken, h.arn)
+			var logs string
+			logToken, logs, err = h.ecsClient.GetLogs(h.ctx, h.taskDetails, logToken)
 			if err != nil {
 				h.handleRunError(err, "unable to pull logs")
 				return
+			}
+
+			if _, err := fmt.Fprintf(fStdout, logs); err != nil {
+				h.handleRunError(err, "failed to write logs to stdout")
 			}
 
 			// ECS task has terminal status phase, meaning the task is going to
@@ -195,14 +209,14 @@ func (h *taskHandle) handleRunError(err error, context string) {
 // stopTask is used to stop the ECS task, and monitor its status until it
 // reaches the stopped state.
 func (h *taskHandle) stopTask() error {
-	if err := h.ecsClient.StopTask(context.TODO(), h.arn); err != nil {
+	if err := h.ecsClient.StopTask(context.TODO(), h.taskDetails); err != nil {
 		return err
 	}
 
 	for {
 		select {
 		case <-time.After(5 * time.Second):
-			status, err := h.ecsClient.DescribeTaskStatus(context.TODO(), h.arn)
+			status, err := h.ecsClient.DescribeTaskStatus(context.TODO(), h.taskDetails)
 			if err != nil {
 				return err
 			}
