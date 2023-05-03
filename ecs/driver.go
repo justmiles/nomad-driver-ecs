@@ -6,7 +6,7 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws/external"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/hashicorp/go-hclog"
@@ -62,11 +62,14 @@ var (
 		"task_definition":       hclspec.NewAttr("task_definition", "string", false),
 		"network_configuration": hclspec.NewBlock("network_configuration", false, awsECSNetworkConfigSpec),
 		"image":                 hclspec.NewAttr("image", "string", true),
+		"log_group":             hclspec.NewAttr("log_group", "string", false),
 		"task_role_arn":         hclspec.NewAttr("task_role_arn", "string", false),
 		"execution_role_arn":    hclspec.NewAttr("execution_role_arn", "string", true),
 		"family":                hclspec.NewAttr("family", "string", false),
 		"command":               hclspec.NewAttr("command", "string", false),
 		"args":                  hclspec.NewAttr("args", "list(string)", false),
+		"memory":                hclspec.NewAttr("memory", "number", false),
+		"cpu":                   hclspec.NewAttr("cpu", "number", false),
 	})
 
 	// awsECSNetworkConfigSpec is the network configuration for the task.
@@ -145,10 +148,10 @@ type ECSTaskConfig struct {
 	LogGroup             string                   `codec:"log_group"`
 	Command              string                   `codec:"command"`
 	Args                 []string                 `codec:"args"`
+	Memory               int64                    `codec:"memory"`
+	CPU                  int64                    `codec:"cpu"`
 
 	Region string // derived from DriverConfig
-	Memory int64
-	CPU    int64
 
 	// Environment []string // TODO: get from main task config
 	// Volumes    []string // TODO
@@ -222,7 +225,7 @@ func (d *Driver) SetConfig(cfg *base.Config) error {
 }
 
 func (d *Driver) getAwsSdk(cluster string) (ecsClientInterface, error) {
-	awsCfg, err := external.LoadDefaultAWSConfig()
+	awsCfg, err := config.LoadDefaultConfig(d.ctx)
 	if err != nil {
 		return nil, fmt.Errorf("unable to load SDK config: %v", err)
 	}
@@ -233,8 +236,8 @@ func (d *Driver) getAwsSdk(cluster string) (ecsClientInterface, error) {
 
 	return awsEcsClient{
 		cluster:    cluster,
-		ecsClient:  ecs.New(awsCfg),
-		logsClient: cloudwatchlogs.New(awsCfg),
+		ecsClient:  ecs.NewFromConfig(awsCfg),
+		logsClient: cloudwatchlogs.NewFromConfig(awsCfg),
 	}, nil
 }
 
@@ -366,12 +369,12 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		driverConfig.Task.LogGroup = "/ecs/" + driverConfig.Task.Family
 	}
 
-	if cfg.Resources.NomadResources.Memory.MemoryMB != 0 {
-		driverConfig.Task.Memory = cfg.Resources.NomadResources.Memory.MemoryMB
+	if driverConfig.Task.Memory == 0 {
+		driverConfig.Task.Memory = 512
 	}
 
-	if cfg.Resources.NomadResources.Cpu.CpuShares != 0 {
-		driverConfig.Task.CPU = cfg.Resources.NomadResources.Cpu.CpuShares
+	if driverConfig.Task.CPU == 0 {
+		driverConfig.Task.CPU = 256
 	}
 
 	arn, err := d.client.RunTask(context.Background(), driverConfig)

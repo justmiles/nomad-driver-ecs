@@ -86,6 +86,14 @@ task "http-server" {
 
 ## TODO
 
-- attach via SSM
-- support env variables
-- retention on logs
+- [x] move resources to task config
+- [x] update log retention for created log groups
+- [ ] deregister task definitions
+- [ ] Support more args:
+  - [ ] Environment []string // TODO: get from main task config
+  - [ ] Volumes []string // TODO
+  - [ ] EfsVolumes []string // TODO
+  - [ ] PortMappings []string TODO: support port mappings
+- [ ] update IP/Port for remote workloads
+- [ ] attach via SSM
+- [ ] reorganize how to pass log group/stream to GetLogs

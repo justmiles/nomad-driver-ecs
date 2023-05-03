@@ -2,13 +2,16 @@ package ecs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
+
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
-	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/smithy-go"
 )
 
 // ecsClientInterface encapsulates all the required AWS functionality to
@@ -58,7 +61,7 @@ type TaskDetails struct {
 func (c awsEcsClient) DescribeCluster(ctx context.Context) error {
 	input := ecs.DescribeClustersInput{Clusters: []string{c.cluster}}
 
-	resp, err := c.ecsClient.DescribeClustersRequest(&input).Send(ctx)
+	resp, err := c.ecsClient.DescribeClusters(ctx, &input)
 	if err != nil {
 		return err
 	}
@@ -82,7 +85,7 @@ func (c awsEcsClient) DescribeTaskStatus(ctx context.Context, taskDetails TaskDe
 		Tasks:   []string{taskDetails.taskARN},
 	}
 
-	resp, err := c.ecsClient.DescribeTasksRequest(&input).Send(ctx)
+	resp, err := c.ecsClient.DescribeTasks(ctx, &input)
 	if err != nil {
 		return "", err
 	}
@@ -98,11 +101,7 @@ func (c awsEcsClient) RunTask(ctx context.Context, cfg TaskConfig) (string, erro
 	}
 
 	taskDefInput := c.buildTaskDefInput(cfg)
-	if err := taskDefInput.Validate(); err != nil {
-		return "", fmt.Errorf("failed to validate: %w", err)
-	}
-
-	registerTaskDefinitionResponse, err := c.ecsClient.RegisterTaskDefinitionRequest(taskDefInput).Send(ctx)
+	registerTaskDefinitionResponse, err := c.ecsClient.RegisterTaskDefinition(ctx, taskDefInput)
 	if err != nil {
 		return "", err
 	}
@@ -110,15 +109,11 @@ func (c awsEcsClient) RunTask(ctx context.Context, cfg TaskConfig) (string, erro
 	cfg.Task.TaskDefinition = *registerTaskDefinitionResponse.TaskDefinition.TaskDefinitionArn
 
 	input := c.buildTaskInput(cfg)
-	if err := input.Validate(); err != nil {
-		return "", fmt.Errorf("failed to validate: %w", err)
-	}
-
-	resp, err := c.ecsClient.RunTaskRequest(input).Send(ctx)
+	resp, err := c.ecsClient.RunTask(ctx, input)
 	if err != nil {
 		return "", err
 	}
-	return *resp.RunTaskOutput.Tasks[0].TaskArn, nil
+	return *resp.Tasks[0].TaskArn, nil
 }
 
 func (c awsEcsClient) confirmLogGroup(ctx context.Context, cfg TaskConfig) error {
@@ -139,8 +134,20 @@ func (c awsEcsClient) confirmLogGroup(ctx context.Context, cfg TaskConfig) error
 	_, err = c.logsClient.CreateLogGroupRequest(&cloudwatchlogs.CreateLogGroupInput{
 		LogGroupName: &cfg.Task.LogGroup,
 	}).Send(ctx)
+	if err != nil {
+		return err
+	}
 
-	return err
+	// set aggressive retention policy for nomad created log groups
+	_, err = c.logsClient.PutRetentionPolicyRequest(&cloudwatchlogs.PutRetentionPolicyInput{
+		LogGroupName:    &cfg.Task.LogGroup,
+		RetentionInDays: aws.Int64(1),
+	}).Send(ctx)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (c awsEcsClient) buildTaskDefInput(cfg TaskConfig) *ecs.RegisterTaskDefinitionInput {
@@ -249,26 +256,49 @@ func (c awsEcsClient) GetLogs(ctx context.Context, taskDetails TaskDetails, logT
 		logEventsInput.NextToken = &logToken
 	}
 
-	logEvents, err := c.logsClient.GetLogEventsRequest(&logEventsInput).Send(ctx)
-
-	// todo handle rate limiting
+	logEvents, err := c.logsClient.GetLogEvents(ctx, &logEventsInput)
 	if err != nil {
-		if awsErr, ok := err.(awserr.Error); ok {
-			// Get error details
-			if awsErr.Code() == "ResourceNotFoundException" {
-				return logToken, "", nil
-			} else {
-				fmt.Println(err)
-			}
-		} else {
-			return logToken, "", err
+		var nfe *types.ResourceNotFoundException
+		if errors.As(err, &nfe) {
+			return logToken, "", nil
 		}
+
+		var oe *smithy.OperationError
+		if errors.As(err, &oe) {
+			return logToken, "", fmt.Errorf("failed to call service: %s, operation: %s, error: %v", oe.Service(), oe.Operation(), oe.Unwrap())
+		}
+
 	}
 
 	var logs string
 	for _, logEvent := range logEvents.Events {
-		logs = fmt.Sprintf("%s%v\t%v\n", logs, time.Unix(*logEvent.Timestamp/1000, 0), *logEvent.Message)
+		ts := time.Unix(*logEvent.Timestamp/1000, 0).Format(time.RFC3339)
+		logs = fmt.Sprintf("%s[%s] - %v\n", logs, ts, *logEvent.Message)
 	}
 
 	return *logEvents.NextForwardToken, logs, nil
 }
+
+// func (c awsEcsClient) DeleteTaskDefinition(ctx context.Context, arn string) error {
+
+// 	// deregister
+// 	deregisterTaskDefinitionInput := &ecs.DeregisterTaskDefinitionInput{
+// 		TaskDefinition: &arn,
+// 	}
+
+// 	_, err := c.ecsClient.DeregisterTaskDefinitionRequest(deregisterTaskDefinitionInput).Send(ctx)
+// 	if err != nil {
+// 		return err
+// 	}
+
+// 	delete
+// 	deleteTaskDefinitionsInput := &ecs.DeleteTaskDefinitionsInput{
+// 		TaskDefinitions: []*string{t.TaskDefinition.TaskDefinitionArn},
+// 	}
+// 	_, err = c.ecsClient.DeleteTaskDefinitions(dtdi).Send(ctx)
+// 	if err != nil {
+// 		return err
+// 	}
+
+// 	return nil
+// }
