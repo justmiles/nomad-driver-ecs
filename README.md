@@ -88,9 +88,9 @@ task "http-server" {
 
 - [x] move resources to task config
 - [x] update log retention for created log groups
-- [ ] deregister task definitions
+- [x] deregister task definitions
 - [ ] Support more args:
-  - [ ] Environment []string // TODO: get from main task config
+  - [x] Environment []string // TODO: get from main task config
   - [ ] Volumes []string // TODO
   - [ ] EfsVolumes []string // TODO
   - [ ] PortMappings []string TODO: support port mappings

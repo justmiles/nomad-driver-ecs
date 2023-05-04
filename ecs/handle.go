@@ -146,10 +146,10 @@ func (h *taskHandle) run() {
 			var logs string
 			logToken, logs, err = h.ecsClient.GetLogs(h.ctx, h.taskDetails, logToken)
 			if err != nil {
-				h.handleRunError(err, "unable to pull logs")
-				return
+				if _, err := fmt.Fprintf(fStderr, "[%s] - unable to pull logs: %v\n", now, err); err != nil {
+					h.handleRunError(err, "failed to write to stderr")
+				}
 			}
-
 			if _, err := fmt.Fprintf(fStdout, logs); err != nil {
 				h.handleRunError(err, "failed to write logs to stdout")
 			}

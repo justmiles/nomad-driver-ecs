@@ -8,10 +8,11 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
-	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
-
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/aws/smithy-go"
+
+	cloudwatchlogsTypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
+	ecsTypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 )
 
 // ecsClientInterface encapsulates all the required AWS functionality to
@@ -26,6 +27,9 @@ type ecsClientInterface interface {
 	// DescribeTaskStatus attempts to return the current health status of the
 	// ECS task and should be used for health checking.
 	DescribeTaskStatus(ctx context.Context, taskDetails TaskDetails) (string, error)
+
+	// RunTRegisterTaskDefinition TODO
+	RegisterTaskDefinition(ctx context.Context, cfg TaskConfig, env map[string]string) (string, error)
 
 	// RunTask is used to trigger the running of a new ECS task based on the
 	// provided configuration. The ARN of the task, as well as any errors are
@@ -95,32 +99,33 @@ func (c awsEcsClient) DescribeTaskStatus(ctx context.Context, taskDetails TaskDe
 // RunTask satisfies the ecs.ecsClientInterface RunTask interface function.
 func (c awsEcsClient) RunTask(ctx context.Context, cfg TaskConfig) (string, error) {
 
-	err := c.confirmLogGroup(ctx, cfg)
+	// TODO: move out of here
+	err := c.CreateLogGroupIfNotExist(ctx, cfg)
 	if err != nil {
 		return "", fmt.Errorf("failed to validate log group: %w", err)
 	}
-
-	taskDefInput := c.buildTaskDefInput(cfg)
-	registerTaskDefinitionResponse, err := c.ecsClient.RegisterTaskDefinition(ctx, taskDefInput)
-	if err != nil {
-		return "", err
-	}
-
-	cfg.Task.TaskDefinition = *registerTaskDefinitionResponse.TaskDefinition.TaskDefinitionArn
 
 	input := c.buildTaskInput(cfg)
 	resp, err := c.ecsClient.RunTask(ctx, input)
 	if err != nil {
 		return "", err
 	}
+
+	// preemptive cleanup
+	err = c.deleteTaskDefinition(ctx, cfg.Task.TaskDefinition)
+	if err != nil {
+		return *resp.Tasks[0].TaskArn, err
+	}
+
 	return *resp.Tasks[0].TaskArn, nil
 }
 
-func (c awsEcsClient) confirmLogGroup(ctx context.Context, cfg TaskConfig) error {
+// CreateLogGroupIfNotExist checks to see if the log groups and creates it if necessary
+func (c awsEcsClient) CreateLogGroupIfNotExist(ctx context.Context, cfg TaskConfig) error {
 
-	describeLogGroupsResponse, err := c.logsClient.DescribeLogGroupsRequest(&cloudwatchlogs.DescribeLogGroupsInput{
+	describeLogGroupsResponse, err := c.logsClient.DescribeLogGroups(ctx, &cloudwatchlogs.DescribeLogGroupsInput{
 		LogGroupNamePrefix: &cfg.Task.LogGroup,
-	}).Send(ctx)
+	})
 	if err != nil {
 		return err
 	}
@@ -131,18 +136,18 @@ func (c awsEcsClient) confirmLogGroup(ctx context.Context, cfg TaskConfig) error
 	}
 
 	// create the log group if not exist
-	_, err = c.logsClient.CreateLogGroupRequest(&cloudwatchlogs.CreateLogGroupInput{
+	_, err = c.logsClient.CreateLogGroup(ctx, &cloudwatchlogs.CreateLogGroupInput{
 		LogGroupName: &cfg.Task.LogGroup,
-	}).Send(ctx)
+	})
 	if err != nil {
 		return err
 	}
 
 	// set aggressive retention policy for nomad created log groups
-	_, err = c.logsClient.PutRetentionPolicyRequest(&cloudwatchlogs.PutRetentionPolicyInput{
+	_, err = c.logsClient.PutRetentionPolicy(ctx, &cloudwatchlogs.PutRetentionPolicyInput{
 		LogGroupName:    &cfg.Task.LogGroup,
-		RetentionInDays: aws.Int64(1),
-	}).Send(ctx)
+		RetentionInDays: aws.Int32(1),
+	})
 	if err != nil {
 		return err
 	}
@@ -150,27 +155,36 @@ func (c awsEcsClient) confirmLogGroup(ctx context.Context, cfg TaskConfig) error
 	return nil
 }
 
-func (c awsEcsClient) buildTaskDefInput(cfg TaskConfig) *ecs.RegisterTaskDefinitionInput {
+func (c awsEcsClient) RegisterTaskDefinition(ctx context.Context, cfg TaskConfig, env map[string]string) (string, error) {
+
+	var taskEnv []ecsTypes.KeyValuePair
+
+	for key, val := range env {
+		taskEnv = append(taskEnv, ecsTypes.KeyValuePair{
+			Name:  &key,
+			Value: &val,
+		})
+	}
 
 	taskDefInput := ecs.RegisterTaskDefinitionInput{
 		Memory: aws.String(fmt.Sprintf("%d", cfg.Task.Memory)),
 		Cpu:    aws.String(fmt.Sprintf("%d", cfg.Task.CPU)),
-		ContainerDefinitions: []ecs.ContainerDefinition{
+		ContainerDefinitions: []ecsTypes.ContainerDefinition{
 			{
-				Command:     append([]string{cfg.Task.Command}, cfg.Task.Args...),
 				Name:        &cfg.Task.Family,
 				Image:       &cfg.Task.Image,
+				Command:     cfg.Task.Command,
 				Interactive: aws.Bool(true),
-				LogConfiguration: &ecs.LogConfiguration{
-					LogDriver: ecs.LogDriverAwslogs,
+				LogConfiguration: &ecsTypes.LogConfiguration{
+					LogDriver: ecsTypes.LogDriverAwslogs,
 					Options: map[string]string{
 						"awslogs-group":         cfg.Task.LogGroup,
 						"awslogs-region":        cfg.Task.Region,
 						"awslogs-stream-prefix": "nomad",
 					},
 				},
-				Essential: aws.Bool(true),
-				// Environment:  buildEnvironmentKeyValuePair(t.Environment),
+				Essential:   aws.Bool(true),
+				Environment: taskEnv,
 				// PortMappings: buildPortMapping(t.Publish),
 				// MountPoints:  m,
 				// VolumesFrom: []*ecs.VolumeFrom{},
@@ -178,18 +192,22 @@ func (c awsEcsClient) buildTaskDefInput(cfg TaskConfig) *ecs.RegisterTaskDefinit
 		},
 		Family: &cfg.Task.Family,
 		// Volumes:     v,
-		// Family:      aws.String(cfg.Task.),
 		// TaskRoleArn: aws.String(t.TaskRoleArn),
 	}
 
 	// Set Fargate specific configuration
-	if cfg.Task.LaunchType == string(ecs.CompatibilityFargate) {
-		taskDefInput.RequiresCompatibilities = []ecs.Compatibility{ecs.CompatibilityFargate}
-		taskDefInput.NetworkMode = ecs.NetworkModeAwsvpc
+	if cfg.Task.LaunchType == string(ecsTypes.CompatibilityFargate) {
+		taskDefInput.RequiresCompatibilities = []ecsTypes.Compatibility{ecsTypes.CompatibilityFargate}
+		taskDefInput.NetworkMode = ecsTypes.NetworkModeAwsvpc
 		taskDefInput.ExecutionRoleArn = &cfg.Task.ExecutionRoleArn
 	}
 
-	return &taskDefInput
+	registerTaskDefinitionResponse, err := c.ecsClient.RegisterTaskDefinition(ctx, &taskDefInput)
+	if err != nil {
+		return "", err
+	}
+
+	return *registerTaskDefinitionResponse.TaskDefinition.TaskDefinitionArn, nil
 }
 
 // buildTaskInput is used to convert the jobspec supplied configuration input
@@ -197,16 +215,16 @@ func (c awsEcsClient) buildTaskDefInput(cfg TaskConfig) *ecs.RegisterTaskDefinit
 func (c awsEcsClient) buildTaskInput(cfg TaskConfig) *ecs.RunTaskInput {
 	input := ecs.RunTaskInput{
 		Cluster:              aws.String(c.cluster),
-		Count:                aws.Int64(1),
+		Count:                aws.Int32(1),
 		StartedBy:            aws.String("nomad-ecs-driver"),
-		NetworkConfiguration: &ecs.NetworkConfiguration{AwsvpcConfiguration: &ecs.AwsVpcConfiguration{}},
+		NetworkConfiguration: &ecsTypes.NetworkConfiguration{AwsvpcConfiguration: &ecsTypes.AwsVpcConfiguration{}},
 	}
 
 	if cfg.Task.LaunchType != "" {
 		if cfg.Task.LaunchType == "EC2" {
-			input.LaunchType = ecs.LaunchTypeEc2
+			input.LaunchType = ecsTypes.LaunchTypeEc2
 		} else if cfg.Task.LaunchType == "FARGATE" {
-			input.LaunchType = ecs.LaunchTypeFargate
+			input.LaunchType = ecsTypes.LaunchTypeFargate
 		}
 	}
 
@@ -218,9 +236,9 @@ func (c awsEcsClient) buildTaskInput(cfg TaskConfig) *ecs.RunTaskInput {
 	if cfg.Task.NetworkConfiguration.TaskAWSVPCConfiguration.AssignPublicIP != "" {
 		assignPublicIp := cfg.Task.NetworkConfiguration.TaskAWSVPCConfiguration.AssignPublicIP
 		if assignPublicIp == "ENABLED" {
-			input.NetworkConfiguration.AwsvpcConfiguration.AssignPublicIp = ecs.AssignPublicIpEnabled
+			input.NetworkConfiguration.AwsvpcConfiguration.AssignPublicIp = ecsTypes.AssignPublicIpEnabled
 		} else if assignPublicIp == "DISABLED" {
-			input.NetworkConfiguration.AwsvpcConfiguration.AssignPublicIp = ecs.AssignPublicIpDisabled
+			input.NetworkConfiguration.AwsvpcConfiguration.AssignPublicIp = ecsTypes.AssignPublicIpDisabled
 		}
 	}
 	if len(cfg.Task.NetworkConfiguration.TaskAWSVPCConfiguration.SecurityGroups) > 0 {
@@ -241,7 +259,7 @@ func (c awsEcsClient) StopTask(ctx context.Context, taskDetails TaskDetails) err
 		Reason:  aws.String("stopped by nomad-ecs-driver automation"),
 	}
 
-	_, err := c.ecsClient.StopTaskRequest(&input).Send(ctx)
+	_, err := c.ecsClient.StopTask(ctx, &input)
 	return err
 }
 
@@ -258,7 +276,7 @@ func (c awsEcsClient) GetLogs(ctx context.Context, taskDetails TaskDetails, logT
 
 	logEvents, err := c.logsClient.GetLogEvents(ctx, &logEventsInput)
 	if err != nil {
-		var nfe *types.ResourceNotFoundException
+		var nfe *cloudwatchlogsTypes.ResourceNotFoundException
 		if errors.As(err, &nfe) {
 			return logToken, "", nil
 		}
@@ -279,26 +297,23 @@ func (c awsEcsClient) GetLogs(ctx context.Context, taskDetails TaskDetails, logT
 	return *logEvents.NextForwardToken, logs, nil
 }
 
-// func (c awsEcsClient) DeleteTaskDefinition(ctx context.Context, arn string) error {
+func (c awsEcsClient) deleteTaskDefinition(ctx context.Context, arn string) error {
 
-// 	// deregister
-// 	deregisterTaskDefinitionInput := &ecs.DeregisterTaskDefinitionInput{
-// 		TaskDefinition: &arn,
-// 	}
+	// deregister the task definition
+	_, err := c.ecsClient.DeregisterTaskDefinition(ctx, &ecs.DeregisterTaskDefinitionInput{
+		TaskDefinition: &arn,
+	})
+	if err != nil {
+		return err
+	}
 
-// 	_, err := c.ecsClient.DeregisterTaskDefinitionRequest(deregisterTaskDefinitionInput).Send(ctx)
-// 	if err != nil {
-// 		return err
-// 	}
+	// delete the task definition
+	_, err = c.ecsClient.DeleteTaskDefinitions(ctx, &ecs.DeleteTaskDefinitionsInput{
+		TaskDefinitions: []string{arn},
+	})
+	if err != nil {
+		return err
+	}
 
-// 	delete
-// 	deleteTaskDefinitionsInput := &ecs.DeleteTaskDefinitionsInput{
-// 		TaskDefinitions: []*string{t.TaskDefinition.TaskDefinitionArn},
-// 	}
-// 	_, err = c.ecsClient.DeleteTaskDefinitions(dtdi).Send(ctx)
-// 	if err != nil {
-// 		return err
-// 	}
-
-// 	return nil
-// }
+	return nil
+}

@@ -66,8 +66,7 @@ var (
 		"task_role_arn":         hclspec.NewAttr("task_role_arn", "string", false),
 		"execution_role_arn":    hclspec.NewAttr("execution_role_arn", "string", true),
 		"family":                hclspec.NewAttr("family", "string", false),
-		"command":               hclspec.NewAttr("command", "string", false),
-		"args":                  hclspec.NewAttr("args", "list(string)", false),
+		"command":               hclspec.NewAttr("command", "list(string)", false),
 		"memory":                hclspec.NewAttr("memory", "number", false),
 		"cpu":                   hclspec.NewAttr("cpu", "number", false),
 	})
@@ -146,14 +145,12 @@ type ECSTaskConfig struct {
 	ExecutionRoleArn     string                   `codec:"execution_role_arn"`
 	Family               string                   `codec:"family"`
 	LogGroup             string                   `codec:"log_group"`
-	Command              string                   `codec:"command"`
-	Args                 []string                 `codec:"args"`
+	Command              []string                 `codec:"command"`
 	Memory               int64                    `codec:"memory"`
 	CPU                  int64                    `codec:"cpu"`
 
 	Region string // derived from DriverConfig
 
-	// Environment []string // TODO: get from main task config
 	// Volumes    []string // TODO
 	// EfsVolumes []string // TODO
 	// PortMappings     []string TODO: support port mappings
@@ -375,6 +372,16 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 
 	if driverConfig.Task.CPU == 0 {
 		driverConfig.Task.CPU = 256
+	}
+
+	// build task definition
+	if driverConfig.Task.TaskDefinition == "" {
+		taskDefinition, err := d.client.RegisterTaskDefinition(context.Background(), driverConfig, cfg.Env)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to register ECS task definition: %v", err)
+		}
+
+		driverConfig.Task.TaskDefinition = taskDefinition
 	}
 
 	arn, err := d.client.RunTask(context.Background(), driverConfig)
