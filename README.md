@@ -91,9 +91,9 @@ task "http-server" {
 - [x] deregister task definitions
 - [ ] Support more args:
   - [x] Environment []string // TODO: get from main task config
-  - [ ] Volumes []string // TODO
-  - [ ] EfsVolumes []string // TODO
-  - [ ] PortMappings []string TODO: support port mappings
+  - [x] Volumes []string // TODO
+  - [x] EfsVolumes []string // TODO
+  - [ ] PortMappings []string TODO: support port mappings for non-fargate containers
 - [ ] update IP/Port for remote workloads
 - [ ] attach via SSM
 - [ ] reorganize how to pass log group/stream to GetLogs

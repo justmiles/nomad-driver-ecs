@@ -12,6 +12,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.18.22
 	github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.20.10
 	github.com/aws/aws-sdk-go-v2/service/ecs v1.26.3
+	github.com/aws/aws-sdk-go-v2/service/ssm v1.36.3
 	github.com/aws/smithy-go v1.13.5
 	github.com/hashicorp/go-hclog v1.2.0
 	github.com/hashicorp/nomad v1.3.0-rc.1

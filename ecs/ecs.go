@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -59,6 +61,10 @@ type TaskDetails struct {
 	group   string
 	stream  string
 }
+
+const (
+	CompatibilityFargateSpot ecsTypes.Compatibility = "FARGATE_SPOT"
+)
 
 // DescribeCluster satisfies the ecs.ecsClientInterface DescribeCluster
 // interface function.
@@ -166,9 +172,12 @@ func (c awsEcsClient) RegisterTaskDefinition(ctx context.Context, cfg TaskConfig
 		})
 	}
 
+	v, m := buildMountPoint(cfg.Task.Volumes, cfg.Task.EfsVolumes)
+
 	taskDefInput := ecs.RegisterTaskDefinitionInput{
-		Memory: aws.String(fmt.Sprintf("%d", cfg.Task.Memory)),
-		Cpu:    aws.String(fmt.Sprintf("%d", cfg.Task.CPU)),
+		Memory:      aws.String(fmt.Sprintf("%d", cfg.Task.Memory)),
+		Cpu:         aws.String(fmt.Sprintf("%d", cfg.Task.CPU)),
+		TaskRoleArn: &cfg.Task.TaskRoleArn,
 		ContainerDefinitions: []ecsTypes.ContainerDefinition{
 			{
 				Name:        &cfg.Task.Family,
@@ -186,17 +195,17 @@ func (c awsEcsClient) RegisterTaskDefinition(ctx context.Context, cfg TaskConfig
 				Essential:   aws.Bool(true),
 				Environment: taskEnv,
 				// PortMappings: buildPortMapping(t.Publish),
-				// MountPoints:  m,
+				MountPoints: m,
 				// VolumesFrom: []*ecs.VolumeFrom{},
 			},
 		},
-		Family: &cfg.Task.Family,
-		// Volumes:     v,
+		Family:  &cfg.Task.Family,
+		Volumes: v,
 		// TaskRoleArn: aws.String(t.TaskRoleArn),
 	}
 
 	// Set Fargate specific configuration
-	if cfg.Task.LaunchType == string(ecsTypes.CompatibilityFargate) {
+	if cfg.Task.LaunchType == string(ecsTypes.CompatibilityFargate) || cfg.Task.LaunchType == string(CompatibilityFargateSpot) {
 		taskDefInput.RequiresCompatibilities = []ecsTypes.Compatibility{ecsTypes.CompatibilityFargate}
 		taskDefInput.NetworkMode = ecsTypes.NetworkModeAwsvpc
 		taskDefInput.ExecutionRoleArn = &cfg.Task.ExecutionRoleArn
@@ -213,18 +222,34 @@ func (c awsEcsClient) RegisterTaskDefinition(ctx context.Context, cfg TaskConfig
 // buildTaskInput is used to convert the jobspec supplied configuration input
 // into the appropriate ecs.RunTaskInput object.
 func (c awsEcsClient) buildTaskInput(cfg TaskConfig) *ecs.RunTaskInput {
+
 	input := ecs.RunTaskInput{
 		Cluster:              aws.String(c.cluster),
 		Count:                aws.Int32(1),
 		StartedBy:            aws.String("nomad-ecs-driver"),
 		NetworkConfiguration: &ecsTypes.NetworkConfiguration{AwsvpcConfiguration: &ecsTypes.AwsVpcConfiguration{}},
+		EnableExecuteCommand: true,
+		EnableECSManagedTags: true,
 	}
 
 	if cfg.Task.LaunchType != "" {
+
+		// Run task on EC2 instances
 		if cfg.Task.LaunchType == "EC2" {
 			input.LaunchType = ecsTypes.LaunchTypeEc2
+
+			// Run task on Fargate
 		} else if cfg.Task.LaunchType == "FARGATE" {
 			input.LaunchType = ecsTypes.LaunchTypeFargate
+
+			// Run task on Fargate Spot
+		} else if cfg.Task.LaunchType == "FARGATE_SPOT" {
+			input.CapacityProviderStrategy = []ecsTypes.CapacityProviderStrategyItem{
+				{
+					CapacityProvider: aws.String(string(CompatibilityFargateSpot)),
+					Weight:           1,
+				},
+			}
 		}
 	}
 
@@ -263,37 +288,47 @@ func (c awsEcsClient) StopTask(ctx context.Context, taskDetails TaskDetails) err
 	return err
 }
 
+// GetLogs function retrieves log events from CloudWatch logs using the AWS SDK.
 func (c awsEcsClient) GetLogs(ctx context.Context, taskDetails TaskDetails, logToken string) (string, string, error) {
+
+	// Create a GetLogEventsInput struct with StartFromHead, LogGroupName, and LogStreamName.
 	logEventsInput := cloudwatchlogs.GetLogEventsInput{
 		StartFromHead: aws.Bool(true),
 		LogGroupName:  &taskDetails.group,
 		LogStreamName: &taskDetails.stream,
 	}
 
+	// If a non-empty logToken is provided, set NextToken property in logEventsInput.
 	if logToken != "" {
 		logEventsInput.NextToken = &logToken
 	}
 
+	// Call GetLogEvents method on the logsClient interface with input instance logEventsInput.
 	logEvents, err := c.logsClient.GetLogEvents(ctx, &logEventsInput)
+
+	// Check if there's any error while calling GetLogEvents method.
 	if err != nil {
+		// Check if the error is due to ResourceNotFoundException.
 		var nfe *cloudwatchlogsTypes.ResourceNotFoundException
 		if errors.As(err, &nfe) {
 			return logToken, "", nil
 		}
 
+		// Check if the error is due to OperationError and return an error message with service name, operation name, and underlying error message.
 		var oe *smithy.OperationError
 		if errors.As(err, &oe) {
 			return logToken, "", fmt.Errorf("failed to call service: %s, operation: %s, error: %v", oe.Service(), oe.Operation(), oe.Unwrap())
 		}
-
 	}
 
+	// Format log events into a readable string format.
 	var logs string
 	for _, logEvent := range logEvents.Events {
 		ts := time.Unix(*logEvent.Timestamp/1000, 0).Format(time.RFC3339)
 		logs = fmt.Sprintf("%s[%s] - %v\n", logs, ts, *logEvent.Message)
 	}
 
+	// Return the NextForwardToken, formatted logs string, and nil (no error).
 	return *logEvents.NextForwardToken, logs, nil
 }
 
@@ -316,4 +351,72 @@ func (c awsEcsClient) deleteTaskDefinition(ctx context.Context, arn string) erro
 	}
 
 	return nil
+}
+
+func buildMountPoint(volumes []string, efsVolumes []string) (v []ecsTypes.Volume, k []ecsTypes.MountPoint) {
+	if len(volumes) < 1 && len(efsVolumes) < 1 {
+		return []ecsTypes.Volume{}, []ecsTypes.MountPoint{}
+	}
+
+	// Add Bind Mounts
+	for i, volume := range volumes {
+		av := strings.Split(volume, ":")
+
+		// default to source path
+		sourcePath := av[0]
+		volumeName := "volume" + strconv.Itoa(i)
+
+		mountPoint := ecsTypes.MountPoint{
+			ContainerPath: &sourcePath,
+			SourceVolume:  aws.String(volumeName),
+			ReadOnly:      aws.Bool(false),
+		}
+
+		volume := ecsTypes.Volume{
+			Name: aws.String(volumeName),
+			Host: &ecsTypes.HostVolumeProperties{
+				SourcePath: aws.String(sourcePath),
+			},
+		}
+
+		// Map container port, if defined
+		if len(av) > 1 {
+			containerPath := av[1]
+			mountPoint.ContainerPath = &containerPath
+		}
+
+		// Append to the slice
+		k = append(k, mountPoint)
+		v = append(v, volume)
+	}
+
+	// Add EFS Mounts
+	for i, volume := range efsVolumes {
+		av := strings.Split(volume, ":")
+		efsFileSystemId := av[0]
+		efsDirectory := av[1]
+		containerDirectory := av[2]
+		volumeName := "volume-efs" + strconv.Itoa(i)
+
+		mountPoint := ecsTypes.MountPoint{
+			ContainerPath: &containerDirectory,
+			SourceVolume:  aws.String(volumeName),
+			ReadOnly:      aws.Bool(false),
+		}
+
+		volume := ecsTypes.Volume{
+			Name: aws.String(volumeName),
+			EfsVolumeConfiguration: &ecsTypes.EFSVolumeConfiguration{
+				// TODO parameterize this
+				FileSystemId: &efsFileSystemId,
+				// TODO pass in root efs mount path explicitly instead of using sourcePath
+				RootDirectory: &efsDirectory,
+			},
+		}
+
+		// Append to the slice
+		k = append(k, mountPoint)
+		v = append(v, volume)
+	}
+	return
 }

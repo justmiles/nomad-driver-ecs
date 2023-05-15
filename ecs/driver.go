@@ -67,6 +67,8 @@ var (
 		"execution_role_arn":    hclspec.NewAttr("execution_role_arn", "string", true),
 		"family":                hclspec.NewAttr("family", "string", false),
 		"command":               hclspec.NewAttr("command", "list(string)", false),
+		"volumes":               hclspec.NewAttr("volumes", "list(string)", false),
+		"efs_volumes":           hclspec.NewAttr("efs_volumes", "list(string)", false),
 		"memory":                hclspec.NewAttr("memory", "number", false),
 		"cpu":                   hclspec.NewAttr("cpu", "number", false),
 	})
@@ -146,6 +148,8 @@ type ECSTaskConfig struct {
 	Family               string                   `codec:"family"`
 	LogGroup             string                   `codec:"log_group"`
 	Command              []string                 `codec:"command"`
+	Volumes              []string                 `codec:"volumes"`
+	EfsVolumes           []string                 `codec:"efs_volumes"`
 	Memory               int64                    `codec:"memory"`
 	CPU                  int64                    `codec:"cpu"`
 
@@ -372,6 +376,10 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 
 	if driverConfig.Task.CPU == 0 {
 		driverConfig.Task.CPU = 256
+	}
+
+	if driverConfig.Task.TaskRoleArn == "" {
+		driverConfig.Task.TaskRoleArn = driverConfig.Task.ExecutionRoleArn
 	}
 
 	// build task definition
